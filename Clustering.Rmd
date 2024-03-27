@@ -1,0 +1,301 @@
+---
+title: "Clustering"
+output: 
+  html_document:
+    code_folding: hide
+---
+
+# Clustering of all samples
+
+Data quality assessment and quality control (i.e. the removal of insufficiently good data) are essential steps of any data analysis. These steps should typically be performed very early in the analysis of a new data set, preceding or in parallel to the differential expression testing.
+
+We define the term quality as fitness for purpose. Our purpose is the detection of differentially expressed genes, and we are looking in particular for samples whose experimental treatment suffered from an anormality that renders the data points obtained from these particular samples detrimental to our purpose.
+
+In this page, you will see all of the analysis performed to understand which samples are potentially going to negatively impact the downstream analysis.
+
+```{r, include=FALSE}
+knitr::opts_chunk$set(cache=TRUE, results='asis')
+source('functions.R')
+library(org.Hs.eg.db)
+library("org.Mmu.eg.db")
+library(biomaRt)
+library(DESeq2)
+library(pheatmap)
+library(dplyr)
+library(RColorBrewer)
+library(pheatmap)
+library(PCAtools)
+library(ggpubr)
+library(yaml)
+library(rhdf5)
+library(tximport)
+library(ensembldb)
+library(EnsDb.Hsapiens.v86)
+library(EnsDb.Mmusculus.v79)
+```
+
+```{r yaml, echo=TRUE,warning=FALSE,message=FALSE,error=FALSE, include=FALSE}
+params <- read_yaml("config.yml")
+```
+
+
+```{r input, echo=TRUE,warning=FALSE,message=FALSE,error=FALSE, include=FALSE}
+
+
+if(params$kallisto){
+  print("kallisto input detected")
+  
+  design_files <- list.files(path='designs_kallisto/', pattern = "design_")
+  
+  # load in the sample metadata file
+  sample_table <- read.csv("kallisto_input.csv")
+  
+  if (dir.exists(params$kallisto_dir)) {
+    path <- file.path(params$kallisto_dir, sample_table$Sample, "abundance.h5")
+    sample_table <- dplyr::mutate(sample_table, path = path)
+
+  if(params$species == "human"){
+    # Create the tx2gene file that will map transcripts to genes
+    Tx <- transcripts(EnsDb.Hsapiens.v86, columns=c("tx_id", "gene_id", "symbol"))
+    Tx <- as_tibble(Tx)
+    Tx <- dplyr::rename(Tx, target_id = tx_id, ens_gene = gene_id, ext_gene = symbol)
+    Tx <- dplyr::select(Tx, "target_id", "ens_gene", "ext_gene")
+    
+  }else if(params$species == "mouse"){
+    Tx <- transcripts(EnsDb.Mmusculus.v79, columns=c("tx_id", "gene_id", "symbol"))
+    Tx <- as_tibble(Tx)
+    Tx <- dplyr::rename(Tx, target_id = tx_id, ens_gene = gene_id, ext_gene = symbol)
+    Tx <- dplyr::select(Tx, "target_id", "ens_gene", "ext_gene")  
+  }else if(params$species == "macaque"){
+    orgSymbols <- keys(org.Mmu.eg.db, keytype="ENSEMBL")
+    mart <- useMart(dataset = "mmulatta_gene_ensembl", biomart='ensembl')
+    tx2gene <- getBM(attributes = c('ensembl_gene_id', 'ensembl_gene_id_version', 'ensembl_transcript_id', 'ensembl_transcript_id_version','entrezgene_id'),
+      filters = 'ensembl_gene_id',
+      values = orgSymbols, 
+      mart = mart)
+    Tx <- tx2gene %>%   dplyr::select(ensembl_transcript_id, ensembl_gene_id)
+    colnames(Tx) <- c("TXNAME", "GENEID")
+
+  }else if(params$species == "pig"){
+    ensembl = useMart(biomart="ENSEMBL_MART_ENSEMBL",
+                  dataset="sscrofa_gene_ensembl", 
+                  host="uswest.ensembl.org",
+                  ensemblRedirect = FALSE)
+    orgSymbols <- unlist(getBM(attributes = 'ensembl_gene_id', mart=ensembl))
+    mart <- useMart(dataset = "sscrofa_gene_ensembl", biomart='ensembl', host="uswest.ensembl.org")
+    tx2gene <- getBM(attributes = c('ensembl_gene_id', 'ensembl_gene_id_version', 'ensembl_transcript_id', 'ensembl_transcript_id_version','entrezgene_id'),
+      filters = 'ensembl_gene_id',
+      values = orgSymbols, 
+      mart = mart)
+    Tx <- tx2gene %>%   dplyr::select(ensembl_transcript_id, ensembl_gene_id)
+    colnames(Tx) <- c("TXNAME", "GENEID")
+  }else if(params$species == "rabbit"){
+    ensembl = useMart(biomart="ENSEMBL_MART_ENSEMBL",
+                  dataset="ocuniculus_gene_ensembl", 
+                  host="uswest.ensembl.org",
+                  ensemblRedirect = FALSE)
+    orgSymbols <- unlist(getBM(attributes = 'ensembl_gene_id', mart=ensembl))
+    mart <- useMart(dataset = "ocuniculus_gene_ensembl", biomart='ensembl', host="uswest.ensembl.org")
+    tx2gene <- getBM(attributes = c('ensembl_gene_id', 'ensembl_gene_id_version', 'ensembl_transcript_id', 'ensembl_transcript_id_version','entrezgene_id'),
+      filters = 'ensembl_gene_id',
+      values = orgSymbols, 
+      mart = mart)
+    Tx <- tx2gene %>%   dplyr::select(ensembl_transcript_id, ensembl_gene_id)
+    colnames(Tx) <- c("TXNAME", "GENEID")
+    }else{ print('please supply a valid species within the config.yml file')}
+    
+    # import Kallisto transcript counts into R using Tximport
+    Txi_gene <- tximport(path, 
+                     type = "kallisto", 
+                     tx2gene = Tx, 
+                     txOut = FALSE, # TRUE outputs transcripts, FALSE outputs gene-level data
+                     countsFromAbundance = "lengthScaledTPM",
+                     ignoreTxVersion = TRUE)
+    # Write the counts to an object (used for metadata and clustering)
+    df_mRNA <- Txi_gene$counts %>% 
+            round() %>% 
+            data.frame()
+    colnames(df_mRNA) <- sample_table$Sample
+    
+    meta_data <- sample_table
+    rownames(meta_data) <- meta_data$Sample
+    
+  if (file.exists(paste0('designs_kallisto/',design_files[1]))) {
+    for (i in design_files){
+    meta_data <- read.table(paste0('designs_kallisto/',i), sep=",", header = TRUE) 
+    rownames(meta_data) <- meta_data$Sample
+    df_mRNA_tmp = df_mRNA[,rownames(meta_data)]
+    all(rownames(meta_data) %in% colnames(df_mRNA_tmp))
+    assign(paste("meta_data", i, sep = "."), meta_data)}
+
+      
+} else {
+    print("No design files were detected please add a file called design_<test>_<control>_<test>_<column>.csv. Please refer to documentation on github for more ifnormation")
+}
+    
+  } else {
+  print("Please add path to the kallisto dir in the config.yml file as it seems to be missing")
+}
+
+  
+  
+  
+}else{
+
+
+design_files <- list.files(path='designs_featurecounts/', pattern = "design_")
+if (file.exists("featurecounts.tsv.gz")) {
+  df_mRNA <- read.table(gzfile("featurecounts.tsv.gz"), sep = "\t", header = TRUE, row.names = 1)
+  colnames(df_mRNA) <- gsub(".", "-", x = colnames(df_mRNA), fixed = T)
+} else {
+  print("Please add featurecounts.tsv.gz into the project folder as it seems to be missing")
+}
+
+
+if (file.exists(paste0('designs_featurecounts/',design_files[1]))) {
+  for (i in design_files){
+  meta_data <- read.table(paste0('designs_featurecounts/',i), sep=",", header = TRUE) 
+  rownames(meta_data) <- meta_data$Sample
+  df_mRNA_tmp = df_mRNA[,rownames(meta_data)]
+  all(rownames(meta_data) %in% colnames(df_mRNA_tmp))
+  assign(paste("meta_data", i, sep = "."), meta_data)
+  }
+} else {
+    print("No design files were detected please add a file called design_<test>_<control>_<test>_<column>.csv. Please refer to documentation on github for more ifnormation")
+}
+
+}
+
+```
+
+
+
+```{r dds, include=FALSE}
+
+if(params$kallisto){
+  for (i in design_files) {
+    meta_data <- get(gsub("SAMPLE_FILE",i , "meta_data.SAMPLE_FILE"))
+    rownames(meta_data) <- meta_data$Sample
+    df_mRNA_tmp = df_mRNA[,rownames(meta_data)]
+    all(rownames(meta_data) %in% colnames(df_mRNA_tmp))
+    model <- as.character(meta_data$model[[1]])
+    dds <- run_deseq2_full(df_mRNA_tmp, meta_data, model)
+    assign(paste("dds_full", i, sep = "."), dds)
+  }
+  }else{
+  for (i in design_files) {
+    meta_data <- get(gsub("SAMPLE_FILE",i , "meta_data.SAMPLE_FILE"))
+    rownames(meta_data) <- meta_data$Sample
+    df_mRNA_tmp = df_mRNA[,rownames(meta_data)]
+    all(rownames(meta_data) %in% colnames(df_mRNA_tmp))
+    model <- as.character(meta_data$model[[1]])
+    dds <- run_deseq2_full(df_mRNA_tmp, meta_data, model)
+    assign(paste("dds_full", i, sep = "."), dds)}
+}
+```
+
+# Heatmap of counts matrix {.tabset .tabset-fade}
+
+To explore a count matrix, it is often instructive to look at it as a heatmap. Below we show how to produce such a heatmap for various transformations of the data. I have plotted a heatmap of the top 200 highly expressed genes to determine if the samples cluster together by condition.
+
+```{r heatmap, echo=FALSE}
+for (i in design_files) {
+  
+  dds <- get(gsub("SAMPLE_FILE",i , "dds_full.SAMPLE_FILE"))
+  meta_data <- get(gsub("SAMPLE_FILE",i , "meta_data.SAMPLE_FILE"))
+  vsd <- varianceStabilizingTransformation(dds, blind=FALSE)
+  select <- order(rowMeans(counts(dds, normalized=TRUE)), decreasing=TRUE)[1:200]
+  data = colData(dds)[,3]
+  df <- as.data.frame(data)
+  annotation <- data.frame(Var1 = meta_data[[3]], Var2 = meta_data[[2]])
+  rownames(annotation) <- colnames(assay(vsd))
+  name <-  gsub(".csv","",i)
+  cat("## ",name,"\n")
+  pheatmap(assay(vsd)[select,], cluster_rows = FALSE, show_rownames = FALSE,
+           cluster_cols = TRUE, annotation =annotation)
+  cat('\n\n')
+}
+
+```
+
+
+# Heatmap of sample-to-sample distances {.tabset .tabset-fade}
+
+Another use of the transformed data is sample clustering. Here, we apply the dist function to the transpose of the transformed count matrix to get sample-to-sample distances.
+
+A heatmap of this distance matrix gives us an overview over similarities and dissimilarities between samples. We have to provide a hierarchical clustering hc to the heatmap function based on the sample distances, or else the heatmap function would calculate a clustering based on the distances between the rows/columns of the distance matrix.
+
+```{r distances, echo=FALSE}
+for (i in design_files) {
+  
+  dds <- get(gsub("SAMPLE_FILE",i , "dds_full.SAMPLE_FILE"))
+  meta_data <- get(gsub("SAMPLE_FILE",i , "meta_data.SAMPLE_FILE"))
+  vsd <- varianceStabilizingTransformation(dds, blind=FALSE)
+  sampleDists <- dist(t(assay(vsd)))
+  samplDistMatrix <- as.matrix(sampleDists)
+  rownames(samplDistMatrix) <- meta_data[[2]]
+  colnames(samplDistMatrix) <- meta_data[[3]]
+  colors <- colorRampPalette(rev(brewer.pal(9, "Blues")) )(255)
+  assign(paste("vsd", i, sep = "."), vsd)
+  
+
+  name <-  gsub(".csv","",i)
+  cat("## ",name,"\n")
+  pheatmap(samplDistMatrix, 
+         clustering_distance_cols = sampleDists, 
+         clustering_distance_rows = sampleDists,
+         color = colors)
+  cat('\n\n')
+}
+
+```
+
+```{r pca_generate, include=FALSE}
+for (i in design_files) {
+  vsd <- get(gsub("SAMPLE_FILE",i , "vsd.SAMPLE_FILE"))
+  meta_data <- get(gsub("SAMPLE_FILE",i , "meta_data.SAMPLE_FILE"))
+  name <-  gsub(".csv","",i)
+  pca_plot <- pca(vsd = vsd)
+  assign(paste("pca_plot", i, sep = "."), pca_plot)
+}
+
+```
+
+# PCA analysis of the samples {.tabset .tabset-fade}
+
+Related to the distance matrix is the PCA plot, which shows the samples in the 2D plane spanned by their first two principal components. This type of plot is useful for visualizing the overall effect of experimental covariates and batch effects.
+
+
+```{r pca, echo=FALSE, messages=FALSE}
+for (i in design_files) {
+  vsd <- get(gsub("SAMPLE_FILE",i , "vsd.SAMPLE_FILE"))
+  pca_plot <- get(gsub("SAMPLE_FILE",i , "pca_plot.SAMPLE_FILE"))
+  meta_data <- get(gsub("SAMPLE_FILE",i , "meta_data.SAMPLE_FILE"))
+  name <-  gsub(".csv","",i)
+  cat("## ",name,"\n")
+  print(pca_biplot(pca_plot,vsd,
+           design = colnames(meta_data)[[2]],
+           title = i,
+           batch = NA))
+  cat('\n\n')
+}
+```
+
+
+# PCA Loadings of the samples {.tabset .tabset-fade}
+
+```{r pca_loadings}
+for (i in design_files) {
+  vsd <- get(gsub("SAMPLE_FILE",i , "vsd.SAMPLE_FILE"))
+  pca_plot <- get(gsub("SAMPLE_FILE",i , "pca_plot.SAMPLE_FILE"))
+  meta_data <- get(gsub("SAMPLE_FILE",i , "meta_data.SAMPLE_FILE"))
+  name <-  gsub(".csv","",i)
+  cat("## ",name,"\n")
+  print(Plot_pca_loadings(vsd = vsd,
+                  nPCs = 6,
+                  gene_prop = 1,
+                  title = "PCA_loadings"))
+  cat('\n\n')
+}
+
+```
